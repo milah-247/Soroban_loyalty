@@ -1,67 +1,86 @@
-import express from "express";
-import cors from "cors";
 import dotenv from "dotenv";
+import { loadSecrets } from "./secrets";
 import { campaignRouter } from "./routes/campaign.routes";
 import { rewardRouter } from "./routes/reward.routes";
-import { startIndexer } from "./indexer/indexer";
+import { analyticsRouter } from "./routes/analytics.routes";
+import { startIndexer, stopIndexer } from "./indexer/indexer";
 import { rpcServer } from "./soroban";
 import { pool } from "./db";
+import { registry, httpRequestsTotal, httpRequestDuration, dbPoolActive, dbPoolIdle, dbPoolWaiting } from "./metrics";
+import { logger, requestLogger, errorAlertMiddleware } from "./logger";
 
+// ── Startup sequence ──────────────────────────────────────────────────────────
+// 1. Load .env (no-op in production where vars are injected)
+// 2. Pull secrets from AWS Secrets Manager (populates process.env)
+// 3. Validate ALL env vars via Zod — exits with a clear error if anything is
+//    missing or malformed. Must happen before any service is initialised.
 dotenv.config();
+await loadSecrets();
+const app = createApp();
 
-const app = express();
-app.use(cors());
-app.use(express.json());
-
-app.get("/health", async (_req, res) => {
-  const startTime = Date.now();
-  const checks: any = {
-    stellar: { reachable: false, latency: 0 },
-    database: { connected: false, responseTime: 0 },
-    indexer: { running: true }
-  };
-
-  // Check Stellar network
-  try {
-    const stellarStart = Date.now();
-    await rpcServer.getHealth();
-    checks.stellar.reachable = true;
-    checks.stellar.latency = Date.now() - stellarStart;
-  } catch (err) {
-    checks.stellar.reachable = false;
-  }
-
-  // Check database
-  try {
-    const dbStart = Date.now();
-    await pool.query('SELECT 1');
-    checks.database.connected = true;
-    checks.database.responseTime = Date.now() - dbStart;
-  } catch (err) {
-    checks.database.connected = false;
-  }
-
-  const allHealthy = checks.stellar.reachable && checks.database.connected;
-  const status = allHealthy ? 'healthy' : (checks.stellar.reachable || checks.database.connected) ? 'degraded' : 'unhealthy';
-
-  res.json({
-    status,
-    checks,
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime()
-  });
+process.on("unhandledRejection", (reason) => {
+  logger.critical(
+    "Unhandled promise rejection",
+    reason instanceof Error ? reason : new Error(String(reason))
+  );
 });
-
-app.use("/campaigns", campaignRouter);
-app.use("/", rewardRouter);
+process.on("uncaughtException", (err) => {
+  Sentry.captureException(err);
+  logger.critical("Uncaught exception", err);
+  process.exit(1);
+});
 
 const PORT = process.env.PORT ?? 3001;
 
-app.listen(PORT, async () => {
-  console.log(`[server] listening on port ${PORT}`);
+const server = app.listen(PORT, async () => {
+  logger.info(`Server listening on port ${PORT}`);
   if (process.env.ENABLE_INDEXER !== "false") {
     await startIndexer();
   }
 });
+
+// ── Graceful shutdown ──────────────────────────────────────────────────────────
+const SHUTDOWN_TIMEOUT_MS = 10_000;
+
+async function gracefulShutdown(signal: string): Promise<void> {
+  logger.info(`Received ${signal}, initiating graceful shutdown...`);
+
+  // Stop accepting new connections
+  await new Promise<void>((resolve, reject) => {
+    server.close((err) => {
+      if (err) {
+        reject(err);
+      } else {
+        resolve();
+      }
+    });
+  });
+  logger.info("HTTP server stopped accepting new connections");
+
+  // Give in-flight requests up to 10s to complete
+  await new Promise<void>((resolve) => {
+    const timeout = setTimeout(() => {
+      logger.warn("Shutdown timeout exceeded, forcing exit");
+      resolve();
+    }, SHUTDOWN_TIMEOUT_MS);
+
+    server.closeAllConnections();
+    clearTimeout(timeout);
+    resolve();
+  });
+
+  // Stop the indexer polling loop
+  stopIndexer();
+
+  // Close the database pool
+  await pool.end();
+  logger.info("Database pool closed");
+
+  logger.info("Graceful shutdown complete, exiting");
+  process.exit(0);
+}
+
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 
 export default app;
